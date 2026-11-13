@@ -67,11 +67,11 @@ export default function App() {
   const [radiusKm, setRadiusKm] = useState(3); // 기본값: 3km 이내 설정
   const [sortBy, setSortBy] = useState('distance'); // 기본값: 가까운 거리순
 
-  // 페이지 및 결과 데이터
+  // 페이지 및 결과 데이터 (기본 페이지 크기 15개로 데이터 범위 축소 및 초고속 응답)
   const [restaurants, setRestaurants] = useState([]);
   const [totalCount, setTotalCount] = useState(0);
   const [page, setPage] = useState(1);
-  const [pageSize] = useState(40); // 3km 반경 내 업소를 풍부하게 수집하도록 넉넉히 설정
+  const [pageSize, setPageSize] = useState(15); // 페이징 및 데이터 범위 축소로 초고속 렌더링
   const [loading, setLoading] = useState(false);
   const [viewMode, setViewMode] = useState('grid');
 
@@ -578,6 +578,10 @@ export default function App() {
           setRadiusKm={setRadiusKm}
           sortBy={sortBy}
           setSortBy={setSortBy}
+          page={page}
+          setPage={setPage}
+          pageSize={pageSize}
+          setPageSize={setPageSize}
           onNavigateToList={() => navigateTo('list')}
           showToast={showToast}
         />
@@ -589,6 +593,7 @@ export default function App() {
           page={page}
           setPage={setPage}
           pageSize={pageSize}
+          setPageSize={setPageSize}
           detectedLocation={detectedLocation}
           isLocating={isLocating}
           onRefreshLocation={() => detectUserLocation(true)}

@@ -621,7 +621,7 @@ async def get_safe_restaurants(
     status: Optional[str] = Query(None, description="영업상태 필터 ('정상', '폐업' 등, 전체는 빈값 또는 ALL)"),
     grade: Optional[str] = Query(None, description="지정등급 필터 ('적합', '매우우수', '우수', '좋음' 등)"),
     page: int = Query(1, ge=1, description="페이지 번호"),
-    size: int = Query(20, ge=1, le=100, description="페이지 크기 (1~100)"),
+    size: int = Query(15, ge=1, le=100, description="페이지 크기 (기본값 15, 데이터 범위 축소로 응답 속도 최적화)"),
     api_key: Optional[str] = Query(None, description="식품안전나라 API 인증키 (선택, 미입력시 기본 키 사용)"),
     user_lat: Optional[float] = Query(None, description="접속자 정밀 위도 (거리 계산용)"),
     user_lng: Optional[float] = Query(None, description="접속자 정밀 경도 (거리 계산용)"),

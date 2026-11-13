@@ -22,7 +22,8 @@ export default function ListView({
   loading,
   page,
   setPage,
-  pageSize,
+  pageSize = 15,
+  setPageSize,
   detectedLocation,
   isLocating,
   onRefreshLocation,
@@ -213,6 +214,23 @@ export default function ListView({
                 onClick={() => { setStatusFilter(st); setPage(1); }}
               >
                 {st === '전체' ? '전체 상태' : st}
+              </button>
+            ))}
+          </div>
+
+          {/* 페이지 크기 축소/조정 필터 (속도 최적화 지원) */}
+          <div className="filter-pills">
+            <span className="filter-pills-label">페이지당:</span>
+            {[10, 15, 20, 30].map((sz) => (
+              <button
+                key={sz}
+                className={`pill-btn ${pageSize === sz ? 'active' : ''}`}
+                onClick={() => {
+                  if (setPageSize) setPageSize(sz);
+                  setPage(1);
+                }}
+              >
+                {sz}개씩
               </button>
             ))}
           </div>

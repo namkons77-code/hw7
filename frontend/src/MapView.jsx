@@ -34,6 +34,10 @@ export default function MapView({
   onSearchSubmit,
   radiusKm = 3.0,
   setRadiusKm,
+  page = 1,
+  setPage,
+  pageSize = 15,
+  setPageSize,
   showToast
 }) {
   const mapContainerRef = useRef(null);
@@ -480,7 +484,12 @@ export default function MapView({
               </div>
             </div>
             <span className="sidebar-count">
-              총 <strong>{restaurants.length}</strong>개
+              총 <strong>{totalCount > 0 ? totalCount.toLocaleString() : restaurants.length}</strong>개
+              {totalCount > pageSize && (
+                <span style={{ fontSize: '0.75rem', color: '#64748b', marginLeft: 4 }}>
+                  ({page}/{Math.ceil(totalCount / pageSize)}p)
+                </span>
+              )}
             </span>
           </div>
 
@@ -549,6 +558,40 @@ export default function MapView({
               })
             )}
           </div>
+
+          {/* 하단 페이징 바: 15개 단위 고속 페이지 전환 지원 */}
+          {totalCount > pageSize && (
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              padding: '10px 14px',
+              borderTop: '1px solid #e2e8f0',
+              background: '#f8fafc',
+              borderBottomLeftRadius: 12,
+              borderBottomRightRadius: 12
+            }}>
+              <button
+                className="btn-card-action-sm"
+                style={{ padding: '6px 12px', opacity: page <= 1 ? 0.4 : 1, cursor: page <= 1 ? 'not-allowed' : 'pointer' }}
+                onClick={() => setPage && setPage(p => Math.max(1, p - 1))}
+                disabled={page <= 1}
+              >
+                ◀ 이전
+              </button>
+              <span style={{ fontSize: '0.82rem', fontWeight: 600, color: '#334155' }}>
+                {page} / {Math.ceil(totalCount / pageSize)} 페이지
+              </span>
+              <button
+                className="btn-card-action-sm"
+                style={{ padding: '6px 12px', opacity: page >= Math.ceil(totalCount / pageSize) ? 0.4 : 1, cursor: page >= Math.ceil(totalCount / pageSize) ? 'not-allowed' : 'pointer' }}
+                onClick={() => setPage && setPage(p => Math.min(Math.ceil(totalCount / pageSize), p + 1))}
+                disabled={page >= Math.ceil(totalCount / pageSize)}
+              >
+                다음 ▶
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </div>
