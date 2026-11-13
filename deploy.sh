@@ -4,6 +4,13 @@ set -e
 echo "=========================================="
 echo "🚀 [1/4] Docker 및 환경 점검..."
 echo "=========================================="
+if [ ! -f backend/.env ]; then
+    if [ -f /home/ubuntu/backend.env.bak ]; then
+        cp /home/ubuntu/backend.env.bak backend/.env
+    else
+        echo "FOOD_SAFETY_API_KEY=7d20b06f384541b7b714" > backend/.env
+    fi
+fi
 if ! command -v docker &> /dev/null; then
     echo "Docker 설치 진행 중..."
     sudo apt-get update

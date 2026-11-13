@@ -21,3 +21,5 @@ dist-ssr/
 
 # Logs
 *.log
+*.tar.gz
+*.pem
