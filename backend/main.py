@@ -5,6 +5,7 @@ import asyncio
 import urllib.parse
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
@@ -17,10 +18,32 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env", override=True)
 load_dotenv(BASE_DIR.parent / ".env", override=True)
 
+# 전역 지속 연결 HTTP 클라이언트 (TCP 핸드셰이크/SSL 재사용으로 요청 지연 100ms 단축)
+HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    """공유 비동기 HTTP 클라이언트 반환 (지연 생성 및 연결 풀 재사용)"""
+    global HTTP_CLIENT
+    if HTTP_CLIENT is None or HTTP_CLIENT.is_closed:
+        HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=3.0, read=8.0, write=5.0, pool=10.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
+        )
+    return HTTP_CLIENT
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global HTTP_CLIENT
+    HTTP_CLIENT = await get_http_client()
+    yield
+    if HTTP_CLIENT is not None and not HTTP_CLIENT.is_closed:
+        await HTTP_CLIENT.aclose()
+
 app = FastAPI(
     title="식품안심업소(위생등급) 지정현황 API",
     description="식품의약품안전처 식품안전나라(C004) Open API 연동 백엔드 서비스",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Gzip 압축 미들웨어 적용 (네트워크 전송량 80% 이상 절감 및 응답속도 향상)
@@ -41,48 +64,41 @@ raw_key = raw_key.strip("'\" ") if raw_key else ""
 FOOD_SAFETY_DEFAULT_KEY = raw_key if raw_key and raw_key != "sample" else "7d20b06f384541b7b714"
 FOOD_SAFETY_BASE_URL = "http://openapi.foodsafetykorea.go.kr/api"
 
-# 주소 지오코딩 캐시 (빠른 응답을 위해 메모리 캐싱)
+# 주소 지오코딩 및 C004 메모리 캐시 (Bounded Cache로 메모리 누수 방지)
+MAX_GEO_CACHE = 10000
+MAX_RESTAURANT_CACHE = 1000
 GEO_CACHE: Dict[str, Tuple[float, float]] = {}
-
-# 식품안전나라 C004 응답 메모리 캐시 (동시접속 INFO-500 방지 및 즉각 응답 지원)
 RESTAURANT_CACHE: Dict[str, Tuple[float, List[dict], int]] = {}
+
+def set_geo_cache(key: str, val: Tuple[float, float]):
+    if len(GEO_CACHE) >= MAX_GEO_CACHE:
+        GEO_CACHE.pop(next(iter(GEO_CACHE)))
+    GEO_CACHE[key] = val
+
+def set_restaurant_cache(key: str, val: Tuple[float, List[dict], int]):
+    if len(RESTAURANT_CACHE) >= MAX_RESTAURANT_CACHE:
+        RESTAURANT_CACHE.pop(next(iter(RESTAURANT_CACHE)))
+    RESTAURANT_CACHE[key] = val
 
 # 공공데이터 API 단일 동시 호출 제어 락 (INFO-500 동시접속 제한 원천 차단)
 FOOD_SAFETY_API_LOCK = asyncio.Lock()
 
-# 주요 동/읍/면 기준 좌표 데이터베이스 (OpenStreetMap 429 제한 대비 초고속 오프라인 지오코딩 지원)
-DONG_COORDINATES: Dict[str, Tuple[float, float]] = {
-    # 대구광역시 수성구
-    "범어동": (35.8585, 128.6238), "범어1동": (35.8585, 128.6238), "범어2동": (35.8610, 128.6270),
-    "범어3동": (35.8640, 128.6240), "범어4동": (35.8520, 128.6300),
-    "만촌동": (35.8550, 128.6500), "만촌1동": (35.8600, 128.6460), "만촌2동": (35.8530, 128.6510), "만촌3동": (35.8490, 128.6530),
-    "황금동": (35.8390, 128.6240), "황금1동": (35.8410, 128.6280), "황금2동": (35.8370, 128.6200),
-    "중동": (35.8450, 128.6080), "상동": (35.8320, 128.6100), "파동": (35.8150, 128.6150),
-    "두산동": (35.8280, 128.6250), "지산동": (35.8230, 128.6360), "지산1동": (35.8270, 128.6340), "지산2동": (35.8200, 128.6380),
-    "범물동": (35.8170, 128.6430), "범물1동": (35.8190, 128.6410), "범물2동": (35.8150, 128.6450),
-    "수성동": (35.8550, 128.6100), "수성동1가": (35.8550, 128.6080), "수성동2가": (35.8530, 128.6120),
-    "수성동3가": (35.8510, 128.6130), "수성동4가": (35.8580, 128.6120),
-    "고산동": (35.8420, 128.7050), "고산1동": (35.8410, 128.7010), "고산2동": (35.8481, 128.6968), "고산3동": (35.8430, 128.7180),
-    "시지동": (35.8420, 128.7050), "매호동": (35.8430, 128.7150), "신매동": (35.8400, 128.7080), "사월동": (35.8380, 128.7230),
-    "노변동": (35.8440, 128.6970), "연호동": (35.8510, 128.6820), "가천동": (35.8600, 128.6830), "삼덕동": (35.8350, 128.6750),
-    "대흥동": (35.8460, 128.6880), "이천동": (35.8530, 128.6890),
-    # 대구광역시 타 구
-    "동성로": (35.8690, 128.5960), "남산동": (35.8630, 128.5880), "대봉동": (35.8580, 128.6000), "동인동": (35.8710, 128.6050),
-    "신암동": (35.8860, 128.6250), "신천동": (35.8720, 128.6200), "효목동": (35.8790, 128.6430),
-    "대명동": (35.8460, 128.5830), "봉덕동": (35.8460, 128.5970),
-    "침산동": (35.8880, 128.5900), "산격동": (35.8920, 128.6080), "복현동": (35.8960, 128.6220),
-    "월성동": (35.8290, 128.5320), "상인동": (35.8190, 128.5370), "진천동": (35.8140, 128.5250),
-    # 서울특별시 강남/서초
-    "역삼동": (37.4999, 127.0360), "삼성동": (37.5140, 127.0560), "청담동": (37.5250, 127.0500),
-    "신사동": (37.5240, 127.0220), "논현동": (37.5110, 127.0280), "압구정동": (37.5300, 127.0330),
-    "대치동": (37.4940, 127.0620), "도곡동": (37.4880, 127.0450), "서초동": (37.4910, 127.0120),
-    "반포동": (37.5040, 127.0050), "방배동": (37.4820, 126.9920), "양재동": (37.4730, 127.0420)
-}
-
 try:
-    from backend.geo_data import PROVINCE_COORDINATES, DISTRICT_COORDINATES
+    from backend.geo_data import (
+        PROVINCE_COORDINATES,
+        DISTRICT_COORDINATES,
+        SORTED_DISTRICTS,
+        DONG_COORDINATES,
+        DISTRICT_DONGS
+    )
 except ImportError:
-    from geo_data import PROVINCE_COORDINATES, DISTRICT_COORDINATES
+    from geo_data import (
+        PROVINCE_COORDINATES,
+        DISTRICT_COORDINATES,
+        SORTED_DISTRICTS,
+        DONG_COORDINATES,
+        DISTRICT_DONGS
+    )
 
 PROV_ALIASES: Dict[str, str] = {
     "서울": "서울특별시", "서울특별시": "서울특별시",
@@ -104,59 +120,26 @@ PROV_ALIASES: Dict[str, str] = {
     "제주": "제주특별자치도", "제주도": "제주특별자치도", "제주특별자치도": "제주특별자치도",
 }
 
-# 시/군/구별 소속 읍/면/동 목록 데이터베이스 (동 선택 지원용)
-DISTRICT_DONGS: Dict[str, List[str]] = {
-    # 대구광역시
-    "수성구": ["범어동", "만촌동", "황금동", "중동", "상동", "파동", "두산동", "지산동", "범물동", "수성동1가", "수성동2가", "수성동3가", "수성동4가", "고산1동", "고산2동", "고산3동", "시지동", "신매동", "매호동", "사월동", "노변동", "연호동", "가천동", "삼덕동", "대흥동", "이천동"],
-    "중구": ["동성로", "남산동", "대봉동", "동인동", "삼덕동", "봉산동", "대신동", "달성동", "계산동", "종로", "수창동", "태평로", "교동", "북성로", "서문로"],
-    "동구": ["신암동", "신천동", "효목동", "봉무동", "불로동", "지저동", "방촌동", "율하동", "신기동", "동호동", "각산동", "신서동", "동내동", "괴전동", "금강동", "대림동", "사복동", "용계동", "입석동", "검사동"],
-    "서구": ["내당동", "비산동", "평리동", "상리동", "중리동", "이현동", "원대동"],
-    "남구": ["대명동", "봉덕동", "이천동"],
-    "북구": ["칠성동", "침산동", "산격동", "복현동", "검단동", "동변동", "서변동", "읍내동", "학정동", "국우동", "구암동", "동천동", "관음동", "태전동", "매천동", "팔달동", "금호동", "사수동", "노원동", "대현동"],
-    "달서구": ["성당동", "두류동", "파호동", "호림동", "신당동", "이곡동", "장기동", "용산동", "죽전동", "감삼동", "본리동", "상인동", "도원동", "진천동", "유천동", "대천동", "월성동", "송현동", "대곡동", "호산동"],
-    "달성군": ["화원읍", "논공읍", "다사읍", "유가읍", "옥포읍", "현풍읍", "가창면", "하빈면", "구지면"],
-    "군위군": ["군위읍", "소보면", "효령면", "부계면", "우보면", "의흥면", "산성면", "삼국유사면"],
-    # 서울특별시
-    "강남구": ["역삼동", "개포동", "청담동", "삼성동", "대치동", "신사동", "논현동", "압구정동", "세곡동", "자곡동", "율현동", "일원동", "수서동", "도곡동"],
-    "서초구": ["서초동", "잠원동", "반포동", "방배동", "양재동", "우면동", "원지동", "내곡동", "염곡동", "신원동"],
-    "송파구": ["잠실동", "신천동", "풍납동", "송파동", "석촌동", "삼전동", "가락동", "문정동", "장지동", "방이동", "오금동", "거여동", "마천동"],
-    "마포구": ["공덕동", "아현동", "도화동", "용강동", "대흥동", "염리동", "신수동", "서교동", "동교동", "합정동", "망원동", "연남동", "성산동", "상암동"],
-    "종로구": ["청운동", "효자동", "사직동", "삼청동", "부암동", "평창동", "가회동", "종로1가", "종로2가", "종로3가", "종로4가", "종로5가", "혜화동", "명륜동", "창신동", "숭인동", "평동", "무악동"],
-    "영등포구": ["여의도동", "영등포동", "당산동", "도림동", "문래동", "양평동", "신길동", "대림동"],
-    "용산구": ["이태원동", "한남동", "한강로동", "원효로동", "후암동", "청파동", "효창동", "용문동", "이촌동", "보광동"],
-    "강서구": ["염창동", "등촌동", "화곡동", "가양동", "마곡동", "내발산동", "외발산동", "공항동", "방화동", "개화동"],
-    "관악구": ["봉천동", "신림동", "남현동"],
-    "노원구": ["상계동", "중계동", "하계동", "월계동", "공릉동"],
-    # 부산광역시
-    "해운대구": ["우동", "중동", "좌동", "송정동", "반여동", "반송동", "재송동"],
-    "부산진구": ["부전동", "범전동", "연지동", "초읍동", "양정동", "전포동", "부암동", "당감동", "가야동", "개금동", "범천동"],
-    "수영구": ["남천동", "수영동", "망미동", "광안동", "민락동"],
-    "동래구": ["명륜동", "온천동", "사직동", "안락동", "명장동"],
-    # 인천광역시
-    "연수구": ["송도동", "옥련동", "선학동", "연수동", "청학동", "동춘동"],
-    "부평구": ["부평동", "십정동", "산곡동", "청천동", "삼산동", "갈산동", "부개동"],
-    # 광주광역시
-    "광산구": ["수완동", "첨단동", "신가동", "신흥동", "송정동", "운남동", "월곡동", "하남동"],
-    "서구": ["치평동", "상무동", "화정동", "풍암동", "금호동", "광천동", "농성동"],
-    # 대전광역시
-    "유성구": ["봉명동", "도룡동", "전민동", "관평동", "신성동", "노은동", "지족동", "반석동", "원신흥동", "상대동"],
-    "서구": ["둔산동", "탄방동", "월평동", "갈마동", "만년동", "괴정동", "도안동", "관저동"],
-    # 울산광역시
-    "남구": ["삼산동", "달동", "신정동", "무거동", "옥동", "야음동"],
-    # 경기도
-    "수원시": ["영통동", "이의동", "매탄동", "인계동", "권선동", "정자동", "천천동", "화서동", "행궁동"],
-    "성남시": ["판교동", "백현동", "삼평동", "운중동", "정자동", "서현동", "수내동", "야탑동", "이매동"],
-    "고양시": ["일산동", "주엽동", "마두동", "백석동", "장항동", "화정동", "행신동", "삼송동", "원흥동"],
-    "용인시": ["수지동", "풍덕천동", "죽전동", "동천동", "신봉동", "상현동", "보정동", "기흥동", "역북동"]
-}
+# 런타임 정렬 비용 0화를 위한 사전 정렬된 시도 별칭 목록
+SORTED_PROV_ALIASES = sorted(PROV_ALIASES.items(), key=lambda x: -len(x[0]))
+
+# 정규표현식 사전 컴파일 (C 레벨 고속 매칭)
+RE_PARENS = re.compile(r'\(.*?\)')
+RE_FLOOR = re.compile(r'\s*\d+층.*')
+RE_ROOM = re.compile(r'\s*\d+호.*')
+RE_DONG = re.compile(r'제?\d+동.*')
+RE_BRACKET_DONG = re.compile(r'\((?:[^\)]*?\s+)?([가-힣\d]+(?:동|가|읍|면))(?:\s+[^\)]*?)?\)')
+RE_STRIP_DONG = re.compile(r'(?:동|가|읍|면|\d+)$')
+
+DONG_SEARCH_PATTERNS = [(d, RE_STRIP_DONG.sub('', d)) for d in DONG_COORDINATES]
 
 
 def clean_address(raw_addr: str) -> str:
-    """도로명 및 지번 주소 정제 (층, 호, 상세 괄호 제거)"""
-    cleaned = re.sub(r'\(.*?\)', '', raw_addr)
-    cleaned = re.sub(r'\s*\d+층.*', '', cleaned)
-    cleaned = re.sub(r'\s*\d+호.*', '', cleaned)
-    cleaned = re.sub(r'제?\d+동.*', '', cleaned)
+    """도로명 및 지번 주소 정제 (층, 호, 상세 괄호 제거 - 사전 컴파일 정규식 활용)"""
+    cleaned = RE_PARENS.sub('', raw_addr)
+    cleaned = RE_FLOOR.sub('', cleaned)
+    cleaned = RE_ROOM.sub('', cleaned)
+    cleaned = RE_DONG.sub('', cleaned)
     return cleaned.strip()
 
 
@@ -169,7 +152,7 @@ def get_deterministic_offset(seed_str: str) -> Tuple[float, float]:
     return dlat, dlng
 
 
-async def geocode_address(client: httpx.AsyncClient, address: str, bssh_nm: str = "", fallback_region: str = "") -> Tuple[Optional[float], Optional[float]]:
+async def geocode_address(client: Optional[httpx.AsyncClient], address: str, bssh_nm: str = "", fallback_region: str = "") -> Tuple[Optional[float], Optional[float]]:
     """주소를 위도, 경도 좌표로 변환 (시/도 및 시/군/구 정밀 오프라인 매핑 -> 동 매핑 -> 외부 지오코더 순)"""
     cleaned = clean_address(address)
     cache_key = f"{cleaned}:{bssh_nm}:{fallback_region}"
@@ -179,7 +162,7 @@ async def geocode_address(client: httpx.AsyncClient, address: str, bssh_nm: str 
     # 1. 주소 내 '동/가/읍/면' 식별 및 오프라인 고정밀 좌표 매핑
     matched_dong = None
     # 괄호 안 동 우선 추출: 예 (2층 범어동) -> 범어동
-    m_bracket = re.search(r'\((?:[^\)]*?\s+)?([가-힣\d]+(?:동|가|읍|면))(?:\s+[^\)]*?)?\)', address)
+    m_bracket = RE_BRACKET_DONG.search(address)
     if m_bracket:
         candidate = m_bracket.group(1)
         if candidate in DONG_COORDINATES:
@@ -192,9 +175,8 @@ async def geocode_address(client: httpx.AsyncClient, address: str, bssh_nm: str 
                 break
 
     if not matched_dong:
-        for dong_name in DONG_COORDINATES:
-            base_dong = re.sub(r'(?:동|가|읍|면|\d+)$', '', dong_name)
-            if len(base_dong) >= 2 and re.search(rf'{re.escape(base_dong)}[가-힣\d]*(?:동|가|읍|면)', address):
+        for dong_name, base_dong in DONG_SEARCH_PATTERNS:
+            if len(base_dong) >= 2 and base_dong in address:
                 matched_dong = dong_name
                 break
 
@@ -205,7 +187,7 @@ async def geocode_address(client: httpx.AsyncClient, address: str, bssh_nm: str 
             final_coords = (round(base_lat + dlat, 6), round(base_lng + dlng, 6))
         else:
             final_coords = (base_lat, base_lng)
-        GEO_CACHE[cache_key] = final_coords
+        set_geo_cache(cache_key, final_coords)
         return final_coords
 
     # 2. 시/도 단독 검색인 경우 (예: "서울특별시", "부산광역시")
@@ -213,23 +195,22 @@ async def geocode_address(client: httpx.AsyncClient, address: str, bssh_nm: str 
     for alias, prov in PROV_ALIASES.items():
         if clean_no_space == alias or clean_no_space == alias.replace(" ", ""):
             coords = PROVINCE_COORDINATES[prov]
-            GEO_CACHE[cache_key] = coords
+            set_geo_cache(cache_key, coords)
             return coords
 
-    # 3. 주소 또는 fallback_region 에서 시/도 판별
+    # 3. 주소 또는 fallback_region 에서 시/도 판별 (사전 정렬된 별칭 목록 활용)
     found_prov = None
-    for alias, prov in sorted(PROV_ALIASES.items(), key=lambda x: -len(x[0])):
+    for alias, prov in SORTED_PROV_ALIASES:
         if alias in cleaned or (fallback_region and alias in fallback_region):
             found_prov = prov
             break
 
-    # 4. 시/군/구 정밀 매핑 (단어 경계 및 정확한 토큰 매칭으로 '남구'가 '강남구'에 오인 매칭되는 문제 차단)
+    # 4. 시/군/구 정밀 매핑 (사전 정렬된 229개 목록 활용으로 런타임 정렬 비용 0)
     tokens = cleaned.split()
     matched_coords = None
 
-    # 모든 알려진 (prov, dist) 쌍 중 검색 (이름 긴 구/군 우선)
-    for (p, d), coords in sorted(DISTRICT_COORDINATES.items(), key=lambda x: -len(x[0][1])):
-        if d in tokens or re.search(rf'(?:^|\s){re.escape(d)}(?:$|\s)', cleaned):
+    for (p, d), coords in SORTED_DISTRICTS:
+        if d in tokens or (f" {d} " in f" {cleaned} "):
             if found_prov and p == found_prov:
                 matched_coords = coords
                 break
@@ -242,29 +223,31 @@ async def geocode_address(client: httpx.AsyncClient, address: str, bssh_nm: str 
             final_coords = (round(matched_coords[0] + dlat, 6), round(matched_coords[1] + dlng, 6))
         else:
             final_coords = matched_coords
-        GEO_CACHE[cache_key] = final_coords
+        set_geo_cache(cache_key, final_coords)
         return final_coords
 
     # 5. 시/도만 판별된 경우 해당 시/도 중심 좌표 반환
     if found_prov and found_prov in PROVINCE_COORDINATES:
         coords = PROVINCE_COORDINATES[found_prov]
-        GEO_CACHE[cache_key] = coords
+        set_geo_cache(cache_key, coords)
         return coords
 
-    # 6. 외부 지오코더 (폴백)
-    headers = {"User-Agent": "FoodSafetyKoreaViewer/2.0 (contact: map@service.kr)"}
-    try:
-        url = f"https://nominatim.openstreetmap.org/search?format=json&q={urllib.parse.quote(cleaned)}"
-        resp = await client.get(url, headers=headers)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data and len(data) > 0:
-                lat = float(data[0]["lat"])
-                lng = float(data[0]["lon"])
-                GEO_CACHE[cache_key] = (lat, lng)
-                return lat, lng
-    except Exception:
-        pass
+    # 6. 외부 지오코더 (폴백 - 전역 클라이언트 또는 전달된 클라이언트 활용)
+    effective_client = client or HTTP_CLIENT
+    if effective_client:
+        headers = {"User-Agent": "FoodSafetyKoreaViewer/2.0 (contact: map@service.kr)"}
+        try:
+            url = f"https://nominatim.openstreetmap.org/search?format=json&q={urllib.parse.quote(cleaned)}"
+            resp = await effective_client.get(url, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and len(data) > 0:
+                    lat = float(data[0]["lat"])
+                    lng = float(data[0]["lon"])
+                    set_geo_cache(cache_key, (lat, lng))
+                    return lat, lng
+        except Exception:
+            pass
 
     # 기본 대구 수성구 범어동 폴백
     if bssh_nm:
@@ -272,7 +255,7 @@ async def geocode_address(client: httpx.AsyncClient, address: str, bssh_nm: str 
         fallback_coord = (round(35.8585 + dlat, 6), round(128.6238 + dlng, 6))
     else:
         fallback_coord = (35.8585, 128.6238)
-    GEO_CACHE[cache_key] = fallback_coord
+    set_geo_cache(cache_key, fallback_coord)
     return fallback_coord
 
 
@@ -448,7 +431,7 @@ def offline_reverse_geocode(lat: float, lng: float) -> Dict[str, Any]:
             min_dong_dist = dist
             matched_dong = dong
 
-    dong_name = matched_dong if math.sqrt(min_dong_dist) <= 3.5 else ""
+    dong_name = matched_dong if min_dong_dist <= 12.25 else ""
     detailed_name = f"{best_prov} {best_dist} {dong_name}".strip()
 
     return {
@@ -471,14 +454,15 @@ async def perform_reverse_geocode(lat: float, lng: float, client: Optional[httpx
     if 33.0 <= lat <= 38.8 and 124.5 <= lng <= 132.0:
         return offline_reverse_geocode(lat, lng)
 
+    effective_client = client or HTTP_CLIENT
     should_close = False
-    if client is None:
-        client = httpx.AsyncClient(timeout=3.0)
+    if effective_client is None:
+        effective_client = httpx.AsyncClient(timeout=3.0)
         should_close = True
 
     try:
         url = f"https://api.bigdatacloud.net/data/reverse-geocode-client?latitude={lat}&longitude={lng}&localityLanguage=ko"
-        resp = await client.get(url)
+        resp = await effective_client.get(url)
         if resp.status_code == 200:
             d = resp.json()
             prov = translate_region(d.get("principalSubdivision") or d.get("city") or "")
@@ -635,6 +619,20 @@ async def get_safe_restaurants(
     주소: ADDR
     영업상태: CLSBIZ_DVS_CD_NM
     """
+    # FastAPI Query 객체 방어적 언패킹 (직접 함수 호출 및 테스트 호환)
+    region = region if isinstance(region, str) else None
+    name = name if isinstance(name, str) else None
+    status = status if isinstance(status, str) else None
+    grade = grade if isinstance(grade, str) else None
+    dong = dong if isinstance(dong, str) else None
+    page = page if isinstance(page, int) else 1
+    size = size if isinstance(size, int) else 15
+    user_lat = user_lat if isinstance(user_lat, (int, float)) else None
+    user_lng = user_lng if isinstance(user_lng, (int, float)) else None
+    radius_km = radius_km if isinstance(radius_km, (int, float)) else 3.0
+    sort_by = sort_by if isinstance(sort_by, str) else "distance"
+    api_key = api_key if isinstance(api_key, str) else None
+
     key = api_key.strip() if api_key and api_key.strip() else FOOD_SAFETY_DEFAULT_KEY
     start_idx = (page - 1) * size + 1
     end_idx = page * size
@@ -685,56 +683,56 @@ async def get_safe_restaurants(
                 last_exception = None
                 for attempt in range(3):
                     try:
-                        async with httpx.AsyncClient(timeout=8.0) as client:
-                            resp = await client.get(target_url)
-                            
-                            if resp.status_code != 200:
-                                raise HTTPException(
-                                    status_code=502,
-                                    detail=f"식품안전나라 API 통신 실패 (HTTP {resp.status_code})"
-                                )
+                        client = await get_http_client()
+                        resp = await client.get(target_url)
+                        
+                        if resp.status_code != 200:
+                            raise HTTPException(
+                                status_code=502,
+                                detail=f"식품안전나라 API 통신 실패 (HTTP {resp.status_code})"
+                            )
 
-                            data = resp.json()
+                        data = resp.json()
 
-                            # 응답 구조 파싱
-                            c004_data = data.get("C004", {})
-                            result_info = c004_data.get("RESULT", {})
-                            result_code = result_info.get("CODE", "")
-                            result_msg = result_info.get("MSG", "")
+                        # 응답 구조 파싱
+                        c004_data = data.get("C004", {})
+                        result_info = c004_data.get("RESULT", {})
+                        result_code = result_info.get("CODE", "")
+                        result_msg = result_info.get("MSG", "")
 
-                            # INFO-500: 동시 접속 제한일 때 짧은 대기 후 재시도
-                            if result_code == "INFO-500" and attempt < 2:
-                                await asyncio.sleep(0.8)
-                                continue
+                        # INFO-500: 동시 접속 제한일 때 짧은 대기 후 재시도
+                        if result_code == "INFO-500" and attempt < 2:
+                            await asyncio.sleep(0.8)
+                            continue
 
-                            # 데이터 없음 (INFO-200) 인 경우
-                            if result_code == "INFO-200":
-                                return RestaurantResponse(
-                                    total_count=0,
-                                    page=page,
-                                    size=size,
-                                    region=region or "",
-                                    items=[],
-                                    api_key_used="sample" if key == "sample" else "custom",
-                                    message="해당 조건에 부합하는 식품안심업소가 없습니다."
-                                )
+                        # 데이터 없음 (INFO-200) 인 경우
+                        if result_code == "INFO-200":
+                            return RestaurantResponse(
+                                total_count=0,
+                                page=page,
+                                size=size,
+                                region=region or "",
+                                items=[],
+                                api_key_used="sample" if key == "sample" else "custom",
+                                message="해당 조건에 부합하는 식품안심업소가 없습니다."
+                            )
 
-                            # 정상 처리가 아닌 경우 (키 오류, 파라미터 오류 등)
-                            if result_code != "INFO-000" and not c004_data.get("row"):
-                                return RestaurantResponse(
-                                    total_count=0,
-                                    page=page,
-                                    size=size,
-                                    region=region or "",
-                                    items=[],
-                                    api_key_used="sample" if key == "sample" else "custom",
-                                    message=f"API 응답: {result_msg} ({result_code})"
-                                )
+                        # 정상 처리가 아닌 경우 (키 오류, 파라미터 오류 등)
+                        if result_code != "INFO-000" and not c004_data.get("row"):
+                            return RestaurantResponse(
+                                total_count=0,
+                                page=page,
+                                size=size,
+                                region=region or "",
+                                items=[],
+                                api_key_used="sample" if key == "sample" else "custom",
+                                message=f"API 응답: {result_msg} ({result_code})"
+                            )
 
-                            total_count = int(c004_data.get("total_count", 0))
-                            raw_rows = c004_data.get("row", [])
-                            RESTAURANT_CACHE[target_url] = (time.time(), raw_rows, total_count)
-                            break
+                        total_count = int(c004_data.get("total_count", 0))
+                        raw_rows = c004_data.get("row", [])
+                        set_restaurant_cache(target_url, (time.time(), raw_rows, total_count))
+                        break
                     except HTTPException:
                         raise
                     except Exception as e:
@@ -762,7 +760,7 @@ async def get_safe_restaurants(
             continue
         if dong and dong.strip() and dong.strip() != "전체":
             target_dong = dong.strip()
-            base_dong = re.sub(r'(?:동|가|읍|면|\d+)$', '', target_dong)
+            base_dong = RE_STRIP_DONG.sub('', target_dong)
             if target_dong not in addr and (len(base_dong) >= 2 and base_dong not in addr):
                 continue
 
@@ -780,23 +778,23 @@ async def get_safe_restaurants(
             )
         )
 
-    # 지도 표시를 위한 주소 좌표 비동기 병렬 변환 (최대 20개 내외)
-    async with httpx.AsyncClient(timeout=1.5) as geo_client:
-        geocode_tasks = [
-            geocode_address(geo_client, it.addr, bssh_nm=it.bssh_nm, fallback_region=search_addr or region or "")
-            for it in items
-        ]
-        coords_list = await asyncio.gather(*geocode_tasks, return_exceptions=True)
-        for it, coords in zip(items, coords_list):
-            if isinstance(coords, tuple) and coords[0] is not None and coords[1] is not None:
-                it.lat = coords[0]
-                it.lng = coords[1]
-                
-                # 사용자 정밀 위치가 전달된 경우 거리(m) 계산
-                if user_lat is not None and user_lng is not None:
-                    dist_m = calculate_distance_m(user_lat, user_lng, it.lat, it.lng)
-                    it.distance_m = dist_m
-                    it.distance_text = format_distance(dist_m)
+    # 지도 표시를 위한 주소 좌표 비동기 병렬 변환 (공유 HTTP 클라이언트 재사용)
+    client = await get_http_client()
+    geocode_tasks = [
+        geocode_address(client, it.addr, bssh_nm=it.bssh_nm, fallback_region=search_addr or region or "")
+        for it in items
+    ]
+    coords_list = await asyncio.gather(*geocode_tasks, return_exceptions=True)
+    for it, coords in zip(items, coords_list):
+        if isinstance(coords, tuple) and coords[0] is not None and coords[1] is not None:
+            it.lat = coords[0]
+            it.lng = coords[1]
+            
+            # 사용자 정밀 위치가 전달된 경우 거리(m) 계산
+            if user_lat is not None and user_lng is not None:
+                dist_m = calculate_distance_m(user_lat, user_lng, it.lat, it.lng)
+                it.distance_m = dist_m
+                it.distance_text = format_distance(dist_m)
 
     # 사용자 반경 필터링 (radius_km 가 지정된 경우)
     if radius_km is not None and user_lat is not None and user_lng is not None:
