@@ -105,7 +105,7 @@ export default function MapView({
             onMapCenterChange(center.lat, center.lng);
           }
           isUserDraggingRef.current = false;
-        }, 400);
+        }, 500);
       });
 
       mapInstanceRef.current = map;

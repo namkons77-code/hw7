@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
 import {
   ShieldCheck,
@@ -218,9 +218,17 @@ export default function App() {
   // 지도 중심 위치 상태 (지도를 움직일 때 실시간 반영)
   const [mapCenterLocation, setMapCenterLocation] = useState(null);
   const [isMapMovingLoading, setIsMapMovingLoading] = useState(false);
+  const abortControllerRef = useRef(null);
 
-  // 안심식당 목록 조회 (거리 계산 및 정밀 파라미터 전달)
+  // 안심식당 목록 조회 (거리 계산 및 정밀 파라미터 전달, AbortController로 중복/레이스 컨디션 차단)
   const fetchRestaurants = useCallback(async (forcedMode = null, customCenter = null) => {
+    // 이전 요청이 아직 처리 중이면 즉각 취소(Cancel)하여 대기열 누적 및 중복 호출 차단
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setLoading(true);
     try {
       const currentMode = forcedMode || searchMode;
@@ -228,7 +236,9 @@ export default function App() {
         ? (customCenter || mapCenterLocation)
         : detectedLocation;
 
-      let queryRegion = selectedDistrict || selectedProvince || center.district || center.region || '수성구';
+      let queryRegion = currentMode === 'MAP_CENTER'
+        ? (center.district || center.region || selectedDistrict || '수성구')
+        : (selectedDistrict || selectedProvince || center.district || center.region || '수성구');
 
       const params = {
         region: queryRegion,
@@ -244,10 +254,16 @@ export default function App() {
         sort_by: sortBy
       };
 
-      const res = await axios.get(`${API_BASE}/safe-restaurants`, { params });
+      const res = await axios.get(`${API_BASE}/safe-restaurants`, {
+        params,
+        signal: controller.signal
+      });
       setRestaurants(res.data.items || []);
       setTotalCount(res.data.total_count || 0);
     } catch (err) {
+      if (axios.isCancel(err) || err.name === 'CanceledError') {
+        return; // 이전 요청 취소 건은 무시
+      }
       console.error('업소 조회 실패:', err);
       showToast('안심업소 데이터를 가져오는데 실패했습니다.');
     } finally {
@@ -261,12 +277,12 @@ export default function App() {
     }
   }, [fetchRestaurants, selectedDong]);
 
-  // 사용자가 지도를 움직였을 때 지도 중심 기준 반경 3km 업소 조회 핸들러
+  // 사용자가 지도를 움직였을 때 지도 중심 기준 반경 3km 업소 조회 핸들러 (중복 호출 없이 단일 파이프라인 연계)
   const handleMapCenterChange = useCallback(async (lat, lng) => {
     setSearchMode('MAP_CENTER'); // 기준을 지도 중심으로 전환!
     setIsMapMovingLoading(true);
     try {
-      // 1. 지도 중심 좌표 역지오코딩
+      // 1. 지도 중심 좌표 고속 오프라인 역지오코딩
       const revRes = await axios.get(`${API_BASE}/location/reverse?lat=${lat}&lng=${lng}`);
       let newCenterData = {
         lat,
@@ -278,7 +294,7 @@ export default function App() {
       };
 
       if (revRes.data.status === 'success' || revRes.data.status === 'fallback') {
-        const { region, district, dong, detailed_name, detailed_name_full } = revRes.data;
+        const { region, district, dong, detailed_name } = revRes.data;
         newCenterData = {
           lat,
           lng,
@@ -290,32 +306,14 @@ export default function App() {
         };
       }
 
+      // 지도 중심 위치 업데이트 (useEffect -> fetchRestaurants 단일 경로로 중복 쿼리 없이 자동 연동)
       setMapCenterLocation(newCenterData);
-
-      // 2. 지도 중심 기준 반경 3km 업소 조회
-      const queryRegion = newCenterData.district || newCenterData.region || selectedDistrict || '수성구';
-      const params = {
-        region: queryRegion,
-        name: searchName || undefined,
-        status: statusFilter === '전체' ? undefined : statusFilter,
-        grade: gradeFilter === 'ALL' ? undefined : gradeFilter,
-        page: 1,
-        size: pageSize,
-        user_lat: lat,
-        user_lng: lng,
-        radius_km: radiusKm || 3.0,
-        sort_by: 'distance'
-      };
-
-      const res = await axios.get(`${API_BASE}/safe-restaurants`, { params });
-      setRestaurants(res.data.items || []);
-      setTotalCount(res.data.total_count || 0);
     } catch (err) {
-      console.error('지도 중심 업소 탐색 실패:', err);
+      console.error('지도 중심 역지오코딩 실패:', err);
     } finally {
       setIsMapMovingLoading(false);
     }
-  }, [selectedDistrict, searchName, statusFilter, gradeFilter, radiusKm, pageSize]);
+  }, []);
 
   // 내 실제 접속 위치로 복귀 (다시 접속 위치 기준 모드로 전환)
   const handleReturnToMyLocation = useCallback(() => {
