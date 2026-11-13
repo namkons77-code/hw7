@@ -1,0 +1,20 @@
+7d20b06f384541b7b714
+
+
+
+백엔드는 fastapi를 사용 
+식품접객업소 식품안심업소(위생등급) 지정 현황
+http://openapi.foodsafetykorea.go.kr/api/
+지정등급 HG_ASGN_LV
+업소명 BSSH_NM
+주소 ADDR
+영업상태 CLSBIZ_DVS_CD_NM
+데이터를 가져와 
+
+프론트는 react(vite)를 사용하여 
+접속 지역의 목록을 출력 
+
+
+식품접객업소 식품안심업소(위생등급) 지정 현황
+
+http://openapi.foodsafetykorea.go.kr/api/keyId/serviceId/dataType/startIdx/endIdx

@@ -47,28 +47,8 @@ GEO_CACHE: Dict[str, Tuple[float, float]] = {}
 # 식품안전나라 C004 응답 메모리 캐시 (동시접속 INFO-500 방지 및 즉각 응답 지원)
 RESTAURANT_CACHE: Dict[str, Tuple[float, List[dict], int]] = {}
 
-
-@app.on_event("startup")
-async def startup_event():
-    """서버 기동 시 주요 대도시 중심구 백그라운드 프리웜 캐싱 (첫 접속 대기시간 0초)"""
-    async def warm_cache():
-        await asyncio.sleep(1.0)
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            for warm_reg in ["수성구", "강남구", "중구", "해운대구"]:
-                try:
-                    q = urllib.parse.quote(f"ADDR={warm_reg}", safe="=&")
-                    url = f"{FOOD_SAFETY_BASE_URL}/{FOOD_SAFETY_DEFAULT_KEY}/C004/json/1/40/{q}"
-                    if url not in RESTAURANT_CACHE:
-                        resp = await client.get(url)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            c004 = data.get("C004", {})
-                            if c004.get("RESULT", {}).get("CODE") == "INFO-000":
-                                RESTAURANT_CACHE[url] = (time.time(), c004.get("row", []), int(c004.get("total_count", 0)))
-                        await asyncio.sleep(0.5)
-                except Exception:
-                    pass
-    asyncio.create_task(warm_cache())
+# 공공데이터 API 단일 동시 호출 제어 락 (INFO-500 동시접속 제한 원천 차단)
+FOOD_SAFETY_API_LOCK = asyncio.Lock()
 
 # 주요 동/읍/면 기준 좌표 데이터베이스 (OpenStreetMap 429 제한 대비 초고속 오프라인 지오코딩 지원)
 DONG_COORDINATES: Dict[str, Tuple[float, float]] = {
@@ -694,70 +674,78 @@ async def get_safe_restaurants(
         raw_rows = cached_entry[1]
         total_count = cached_entry[2]
     else:
-        last_exception = None
-        for attempt in range(3):
-            try:
-                async with httpx.AsyncClient(timeout=8.0) as client:
-                    resp = await client.get(target_url)
-                    
-                    if resp.status_code != 200:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"식품안전나라 API 통신 실패 (HTTP {resp.status_code})"
-                        )
+        # 단일 API 락으로 동시 호출 직렬화 (INFO-500 및 동시접속 충돌 100% 방지)
+        async with FOOD_SAFETY_API_LOCK:
+            # 락 획득 후 대기 중 다른 태스크가 이미 캐시를 채웠는지 확인 (Double-checked locking)
+            cached_entry = RESTAURANT_CACHE.get(target_url)
+            if cached_entry and (time.time() - cached_entry[0] < CACHE_TTL_SECONDS):
+                raw_rows = cached_entry[1]
+                total_count = cached_entry[2]
+            else:
+                last_exception = None
+                for attempt in range(3):
+                    try:
+                        async with httpx.AsyncClient(timeout=8.0) as client:
+                            resp = await client.get(target_url)
+                            
+                            if resp.status_code != 200:
+                                raise HTTPException(
+                                    status_code=502,
+                                    detail=f"식품안전나라 API 통신 실패 (HTTP {resp.status_code})"
+                                )
 
-                    data = resp.json()
+                            data = resp.json()
 
-                    # 응답 구조 파싱
-                    c004_data = data.get("C004", {})
-                    result_info = c004_data.get("RESULT", {})
-                    result_code = result_info.get("CODE", "")
-                    result_msg = result_info.get("MSG", "")
+                            # 응답 구조 파싱
+                            c004_data = data.get("C004", {})
+                            result_info = c004_data.get("RESULT", {})
+                            result_code = result_info.get("CODE", "")
+                            result_msg = result_info.get("MSG", "")
 
-                    # INFO-500: 동시 접속 제한일 때 짧은 대기 후 재시도
-                    if result_code == "INFO-500" and attempt < 2:
-                        await asyncio.sleep(0.5)
-                        continue
+                            # INFO-500: 동시 접속 제한일 때 짧은 대기 후 재시도
+                            if result_code == "INFO-500" and attempt < 2:
+                                await asyncio.sleep(0.8)
+                                continue
 
-                    # 데이터 없음 (INFO-200) 인 경우
-                    if result_code == "INFO-200":
-                        return RestaurantResponse(
-                            total_count=0,
-                            page=page,
-                            size=size,
-                            region=region or "",
-                            items=[],
-                            api_key_used="sample" if key == "sample" else "custom",
-                            message="해당 조건에 부합하는 식품안심업소가 없습니다."
-                        )
+                            # 데이터 없음 (INFO-200) 인 경우
+                            if result_code == "INFO-200":
+                                return RestaurantResponse(
+                                    total_count=0,
+                                    page=page,
+                                    size=size,
+                                    region=region or "",
+                                    items=[],
+                                    api_key_used="sample" if key == "sample" else "custom",
+                                    message="해당 조건에 부합하는 식품안심업소가 없습니다."
+                                )
 
-                    # 정상 처리가 아닌 경우 (키 오류, 파라미터 오류 등)
-                    if result_code != "INFO-000" and not c004_data.get("row"):
-                        return RestaurantResponse(
-                            total_count=0,
-                            page=page,
-                            size=size,
-                            region=region or "",
-                            items=[],
-                            api_key_used="sample" if key == "sample" else "custom",
-                            message=f"API 응답: {result_msg} ({result_code})"
-                        )
+                            # 정상 처리가 아닌 경우 (키 오류, 파라미터 오류 등)
+                            if result_code != "INFO-000" and not c004_data.get("row"):
+                                return RestaurantResponse(
+                                    total_count=0,
+                                    page=page,
+                                    size=size,
+                                    region=region or "",
+                                    items=[],
+                                    api_key_used="sample" if key == "sample" else "custom",
+                                    message=f"API 응답: {result_msg} ({result_code})"
+                                )
 
-                    total_count = int(c004_data.get("total_count", 0))
-                    raw_rows = c004_data.get("row", [])
-                    RESTAURANT_CACHE[target_url] = (time.time(), raw_rows, total_count)
-                    break
-            except HTTPException:
-                raise
-            except Exception as e:
-                last_exception = e
-                if attempt < 2:
-                    await asyncio.sleep(1.0)
-                else:
-                    raise HTTPException(
-                        status_code=504,
-                        detail=f"식품안전나라 API 연동 시간 초과 또는 네트워크 오류: {str(e)}"
-                    )
+                            total_count = int(c004_data.get("total_count", 0))
+                            raw_rows = c004_data.get("row", [])
+                            RESTAURANT_CACHE[target_url] = (time.time(), raw_rows, total_count)
+                            break
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        last_exception = e
+                        if attempt < 2:
+                            await asyncio.sleep(1.0)
+                        else:
+                            raise HTTPException(
+                                status_code=504,
+                                detail=f"식품안전나라 API 연동 시간 초과 또는 네트워크 오류: {str(e)}"
+                            )
 
     items: List[RestaurantItem] = []
     for r in raw_rows:
